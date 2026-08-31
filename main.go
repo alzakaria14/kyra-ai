@@ -197,6 +197,8 @@ func loadDotEnv(path string) {
 	}
 	defer f.Close()
 	s := bufio.NewScanner(f)
+	// Beri ruang untuk nilai konfigurasi yang panjang (misalnya URL callback).
+	s.Buffer(make([]byte, 1024), 1024*1024)
 	for s.Scan() {
 		line := strings.TrimSpace(s.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -206,6 +208,9 @@ func loadDotEnv(path string) {
 		if len(kv) == 2 {
 			os.Setenv(strings.TrimSpace(kv[0]), strings.Trim(strings.TrimSpace(kv[1]), "\"'"))
 		}
+	}
+	if err := s.Err(); err != nil {
+		log.Printf("gagal membaca %s: %v", path, err)
 	}
 }
 
