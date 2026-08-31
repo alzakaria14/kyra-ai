@@ -21,11 +21,15 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-type Config struct{ Port, DSN, WAURL, WASession, OllamaURL, OllamaModel, RajaKey, RajaURL, RajaCouriers, OriginCity, OriginAddress, XenditKey, XenditToken, SuccessURL, FailureURL string }
+type Config struct {
+	Port, DSN, WAURL, WASession, OllamaURL, OllamaModel, RajaKey, RajaURL, RajaCouriers, OriginCity, OriginAddress, XenditKey, XenditToken, SuccessURL, FailureURL string
+	MessageQueueSize                                                                                                                                               int
+}
 type App struct {
-	db     *sql.DB
-	cfg    Config
-	client *http.Client
+	db           *sql.DB
+	cfg          Config
+	client       *http.Client
+	messageQueue chan queuedMessage
 }
 type Product struct {
 	ID                     int64
@@ -91,6 +95,9 @@ type inboundMessage struct {
 	From    string `json:"from"`
 	Message string `json:"message"`
 }
+type queuedMessage struct {
+	Phone, Body string
+}
 type xenditEvent struct {
 	ID         string `json:"id"`
 	ExternalID string `json:"external_id"`
@@ -140,13 +147,21 @@ func main() {
 }
 
 func config() Config {
-	return Config{Port: env("PORT", "8080"), DSN: os.Getenv("MYSQL_DSN"), WAURL: strings.TrimRight(env("WHATSAPP_BASE_URL", "http://localhost:5001"), "/"), WASession: env("WHATSAPP_SESSION", "kyra"), OllamaURL: strings.TrimRight(env("OLLAMA_BASE_URL", "http://localhost:11434"), "/"), OllamaModel: env("OLLAMA_MODEL", "qwen3:4b-instruct-2507-q8_0"), RajaKey: os.Getenv("RAJAONGKIR_API_KEY"), RajaURL: strings.TrimRight(env("RAJAONGKIR_BASE_URL", "https://rajaongkir.komerce.id/api/v1"), "/"), RajaCouriers: env("RAJAONGKIR_COURIERS", "jne:jnt:sicepat:ide:sap:ninja:tiki:lion:anteraja:pos:ncs:rex:rpx:sentral:star:wahana:dse"), OriginCity: os.Getenv("STORE_ORIGIN_CITY_ID"), OriginAddress: os.Getenv("STORE_ORIGIN_ADDRESS"), XenditKey: os.Getenv("XENDIT_SECRET_KEY"), XenditToken: os.Getenv("XENDIT_CALLBACK_TOKEN"), SuccessURL: os.Getenv("XENDIT_SUCCESS_REDIRECT_URL"), FailureURL: os.Getenv("XENDIT_FAILURE_REDIRECT_URL")}
+	return Config{Port: env("PORT", "8080"), DSN: os.Getenv("MYSQL_DSN"), WAURL: strings.TrimRight(env("WHATSAPP_BASE_URL", "http://localhost:5001"), "/"), WASession: env("WHATSAPP_SESSION", "kyra"), OllamaURL: strings.TrimRight(env("OLLAMA_BASE_URL", "http://localhost:11434"), "/"), OllamaModel: env("OLLAMA_MODEL", "qwen3:4b-instruct-2507-q8_0"), RajaKey: os.Getenv("RAJAONGKIR_API_KEY"), RajaURL: strings.TrimRight(env("RAJAONGKIR_BASE_URL", "https://rajaongkir.komerce.id/api/v1"), "/"), RajaCouriers: env("RAJAONGKIR_COURIERS", "jne:jnt:sicepat:ide:sap:ninja:tiki:lion:anteraja:pos:ncs:rex:rpx:sentral:star:wahana:dse"), OriginCity: os.Getenv("STORE_ORIGIN_CITY_ID"), OriginAddress: os.Getenv("STORE_ORIGIN_ADDRESS"), XenditKey: os.Getenv("XENDIT_SECRET_KEY"), XenditToken: os.Getenv("XENDIT_CALLBACK_TOKEN"), SuccessURL: os.Getenv("XENDIT_SUCCESS_REDIRECT_URL"), FailureURL: os.Getenv("XENDIT_FAILURE_REDIRECT_URL"), MessageQueueSize: envInt("MESSAGE_QUEUE_SIZE", 100)}
 }
 func env(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
 	}
 	return d
+}
+
+func envInt(k string, d int) int {
+	v, err := strconv.Atoi(os.Getenv(k))
+	if err != nil || v < 1 {
+		return d
+	}
+	return v
 }
 func must(err error) {
 	if err != nil {
@@ -635,15 +650,45 @@ func (a *App) orderCmd(args []string) error {
 }
 
 func (a *App) serve() error {
+	a.startMessageWorker()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("/webhook/message", a.messageWebhook)
 	mux.HandleFunc("/webhook/session", a.sessionWebhook)
 	mux.HandleFunc("/webhook/xendit", a.xenditWebhook)
 	s := &http.Server{Addr: ":" + a.cfg.Port, Handler: logging(mux), ReadHeaderTimeout: 10 * time.Second}
-	log.Printf("Kyra berjalan di http://localhost:%s", a.cfg.Port)
+	log.Printf("Kyra berjalan di http://localhost:%s (antrian pesan: %d)", a.cfg.Port, a.cfg.MessageQueueSize)
 	return s.ListenAndServe()
 }
+
+// startMessageWorker sengaja hanya membuat satu worker. Dengan demikian satu
+// permintaan Ollama harus selesai dulu sebelum pesan berikutnya diproses.
+func (a *App) startMessageWorker() {
+	if a.messageQueue != nil {
+		return
+	}
+	a.messageQueue = make(chan queuedMessage, a.cfg.MessageQueueSize)
+	go func() {
+		for job := range a.messageQueue {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			err := a.respond(ctx, job.Phone, job.Body)
+			cancel()
+			if err != nil {
+				log.Printf("pesan antrean dari %s gagal: %v", job.Phone, err)
+			}
+		}
+	}()
+}
+
+func (a *App) enqueueMessage(phone, body string) bool {
+	select {
+	case a.messageQueue <- queuedMessage{Phone: phone, Body: body}:
+		return true
+	default:
+		return false
+	}
+}
+
 func logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { next.ServeHTTP(w, r) })
 }
@@ -669,11 +714,14 @@ func (a *App) messageWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid sender", 400)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 55*time.Second)
-	defer cancel()
-	if err := a.respond(ctx, phone, in.Message); err != nil {
-		log.Printf("pesan dari %s gagal: %v", phone, err)
-		http.Error(w, "processing failed", 500)
+	if a.messageQueue == nil {
+		http.Error(w, "message queue unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !a.enqueueMessage(phone, in.Message) {
+		// Jangan hilangkan pesan saat antrean penuh. Gateway dapat mencoba ulang
+		// setelah menerima status 503 ini.
+		http.Error(w, "message queue full", http.StatusServiceUnavailable)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -743,6 +791,40 @@ func paymentStatusMessage(status string) string {
 	}
 }
 
+// isKyraRelevant menolak pertanyaan di luar peran toko sebelum Ollama
+// dipanggil. Daftar larangan diperiksa lebih dahulu agar sapaan seperti
+// "buatkan hello world Python" tidak lolos hanya karena mengandung "hello".
+func isKyraRelevant(message string, products []Product, hasForm bool) bool {
+	if hasForm {
+		return true
+	}
+	text := strings.ToLower(strings.TrimSpace(message))
+	for _, term := range []string{
+		"python", "javascript", "pemrograman", "coding", "script", "html", "css", "database", "golang", "hello world", "buatkan program", "buat program", "contoh program", "source code",
+		"presiden", "politik", "pemilu", "menteri", "partai", "berita", "cuaca", "resep", "matematika", "tugas sekolah",
+	} {
+		if strings.Contains(text, term) {
+			return false
+		}
+	}
+	for _, product := range products {
+		name := strings.ToLower(strings.TrimSpace(product.Name))
+		if name != "" && strings.Contains(text, name) {
+			return true
+		}
+	}
+	for _, term := range []string{
+		"produk", "barang", "jual", "beli", "pesan", "pesanan", "order", "kaos", "harga", "ukuran", "warna", "stok", "diskon",
+		"alamat", "penerima", "kota", "provinsi", "kirim", "pengiriman", "ongkir", "resi", "bayar", "pembayaran", "invoice", "konfirmasi",
+		"mau yang", "yang nomor", "satu", "dua", "halo", "hai", "selamat pagi", "selamat siang", "selamat sore", "terima kasih",
+	} {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) respond(ctx context.Context, phone, message string) error {
 	cust, err := a.customer(phone)
 	if err != nil {
@@ -761,6 +843,13 @@ func (a *App) respond(ctx context.Context, phone, message string) error {
 	products, err := a.products()
 	if err != nil {
 		return err
+	}
+	if !isKyraRelevant(message, products, form.any()) {
+		reply := "Maaf ya, saya hanya bisa membantu seputar produk, pemesanan, pengiriman, dan pembayaran di toko ini 😊 Kalau ada yang ingin ditanyakan tentang produk atau pesanan, saya dengan senang hati bantu."
+		if err = a.sendWA(ctx, phone, reply); err != nil {
+			return err
+		}
+		return a.saveMessage(cust.ID, "outbound", reply)
 	}
 	ai, err := a.askLLM(ctx, cust, products, message)
 	if err != nil {
@@ -1044,7 +1133,9 @@ func (a *App) askLLM(ctx context.Context, c Customer, products []Product, messag
 	if err != nil {
 		return AIReply{}, err
 	}
-	system := `Anda adalah Kyra, customer service, marketing, dan sales berbahasa Indonesia. Gunakan bahasa santai dan semi formal yang hangat, natural, jelas, dan tetap sopan. Bersikap membantu seperti admin toko yang ramah; gunakan kalimat lengkap dan lembut, bukan kalimat perintah singkat atau ketus. Contoh gaya: "Tentu, saya bantu cekkan ya 😊" atau "Boleh kirim alamat lengkapnya? Nanti saya bantu lanjutkan." Hindari frasa seperti "ya, lanjutkan pesanan", "isi ini", atau "kirim ulang" tanpa konteks dan kata yang ramah. Jawab singkat dan akurat HANYA dari katalog. Jangan membuat harga, stok, diskon atau status pembayaran. Jangan menyebut nama sistem, API, layanan ongkir, ID kota, SKU, atau istilah teknis kepada pelanggan.
+	system := `Anda adalah Kyra, customer service, marketing, dan sales berbahasa Indonesia. Tugas Anda HANYA membantu seputar katalog produk toko, pemilihan produk, pesanan, data penerima, pengiriman, pembayaran, dan status pesanan. Jangan menjawab atau mengerjakan permintaan di luar tugas toko, termasuk membuat program/kode, pertanyaan politik atau presiden, berita, resep, pendidikan, atau topik umum lainnya. Untuk topik di luar tugas toko, jawab dengan sopan: "Maaf ya, saya hanya bisa membantu seputar produk dan pesanan di toko ini 😊" lalu arahkan kembali ke produk atau pesanan.
+
+Gunakan bahasa santai dan semi formal yang hangat, natural, jelas, dan tetap sopan. Bersikap membantu seperti admin toko yang ramah; gunakan kalimat lengkap dan lembut, bukan kalimat perintah singkat atau ketus. Contoh gaya: "Tentu, saya bantu cekkan ya 😊" atau "Boleh kirim alamat lengkapnya? Nanti saya bantu lanjutkan." Hindari frasa seperti "ya, lanjutkan pesanan", "isi ini", atau "kirim ulang" tanpa konteks dan kata yang ramah. Jawab singkat dan akurat HANYA dari katalog. Jangan membuat harga, stok, diskon atau status pembayaran. Jangan menyebut nama sistem, API, layanan ongkir, ID kota, SKU, atau istilah teknis kepada pelanggan.
 
 Kumpulkan data pesanan: NAMA PRODUK serta kuantitas, nama penerima, alamat lengkap, NAMA KOTA tujuan, dan provinsi bila kota berpotensi ambigu. SKU di katalog hanya untuk pemetaan internal pada JSON items; pilih SKU yang sesuai dari nama produk yang disebut pelanggan, tetapi JANGAN PERNAH menampilkan atau menanyakannya. Jika pelanggan ingin melihat produk, tampilkan nama, deskripsi singkat, dan harga saja. Jangan pernah meminta ID kota.
 

@@ -41,3 +41,17 @@ func TestExpiredPaymentMessageIsFriendly(t *testing.T) {
 		}
 	}
 }
+
+func TestKyraScopeGuard(t *testing.T) {
+	products := []Product{{Name: "Kaos Dayak"}}
+	for _, message := range []string{"tolong buatkan program hello world dengan Python", "siapa presiden Indonesia?"} {
+		if isKyraRelevant(message, products, false) {
+			t.Fatalf("pesan di luar tugas toko lolos: %q", message)
+		}
+	}
+	for _, message := range []string{"jual apa aja?", "saya mau Kaos Dayak", "berapa ongkirnya?"} {
+		if !isKyraRelevant(message, products, false) {
+			t.Fatalf("pesan toko justru ditolak: %q", message)
+		}
+	}
+}
