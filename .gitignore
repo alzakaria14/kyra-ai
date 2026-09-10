@@ -1,3 +1,4 @@
 .env
 kyra.exe
 bin/
+benchmark_results/
