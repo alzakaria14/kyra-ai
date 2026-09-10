@@ -109,14 +109,18 @@ def maximum(samples, key):
     return max(vals) if vals else None
 
 
-def energy_wh(samples, key):
-    """Integral daya trapezoid; None berarti sensor tidak tersedia."""
+def integral_unit_hours(samples, key):
+    """Integral trapezoid nilai sensor terhadap waktu dalam jam.
+
+    Untuk daya (W), hasilnya Wh. Untuk metrik lain, satuannya tetap
+    satuan sensor dikali jam, misalnya MHz·h, %·h, RPM·h, atau °C·h.
+    """
     rows = [s for s in samples if s.get(key) is not None]
     if len(rows) < 2:
         return None
-    watt_seconds = sum((a[key] + b[key]) / 2 * (b["monotonic_s"] - a["monotonic_s"])
+    unit_seconds = sum((a[key] + b[key]) / 2 * (b["monotonic_s"] - a["monotonic_s"])
                        for a, b in zip(rows, rows[1:]))
-    return watt_seconds / 3600
+    return unit_seconds / 3600
 
 
 def rounded(value, digits=3):
@@ -188,12 +192,15 @@ def main():
     write_samples(output / "telemetry.csv", baseline + workload)
     (output / "failures.json").write_text(json.dumps(failures, indent=2), encoding="utf-8")
 
-    def metric(key):
+    def metric(key, unit, is_power=False):
         base, active = mean(baseline, key), mean(workload, key)
+        integral = integral_unit_hours(workload, key)
+        integral_key = "workload_energy_wh" if is_power else f"workload_{unit}_hours"
+        per_message_key = "energy_per_successful_message_wh" if is_power else f"{unit}_hours_per_successful_message"
         return {"baseline_mean": rounded(base), "workload_mean": rounded(active),
                 "increase_from_baseline": rounded(active - base) if active is not None and base is not None else None,
-                "workload_max": rounded(maximum(workload, key)), "workload_energy_wh": rounded(energy_wh(workload, key), 6),
-                "energy_per_successful_message_wh": rounded(energy_wh(workload, key) / len(latencies), 8) if latencies and energy_wh(workload, key) is not None else None}
+                "workload_max": rounded(maximum(workload, key)), integral_key: rounded(integral, 6),
+                per_message_key: rounded(integral / len(latencies), 8) if latencies and integral is not None else None}
 
     duration = workload_end - workload_start
     summary = {"started_utc": datetime.now(timezone.utc).isoformat(), "configuration": vars(args),
@@ -202,11 +209,11 @@ def main():
                "latency_seconds": {"mean": rounded(statistics.fmean(latencies), 3) if latencies else None,
                                    "p50": rounded(statistics.median(latencies), 3) if latencies else None,
                                    "min": rounded(min(latencies), 3) if latencies else None, "max": rounded(max(latencies), 3) if latencies else None},
-               "power_cpu_w": metric("cpu_power_w"), "power_gpu_w": metric("gpu_power_w"),
-               "temperature_cpu_c": metric("cpu_temp_c"), "temperature_gpu_c": metric("gpu_temp_c"),
-               "cpu_load_pct": metric("cpu_load_pct"), "gpu_load_pct": metric("gpu_load_pct"),
-               "cpu_clock_mhz": metric("cpu_clock_mhz"), "gpu_clock_mhz": metric("gpu_clock_mhz"),
-               "gpu_fan_rpm": metric("gpu_fan_rpm"), "telemetry": {"baseline_samples": len(baseline), "workload_samples": len(workload), "errors": monitor.errors}}
+               "power_cpu_w": metric("cpu_power_w", "w", is_power=True), "power_gpu_w": metric("gpu_power_w", "w", is_power=True),
+               "temperature_cpu_c": metric("cpu_temp_c", "c"), "temperature_gpu_c": metric("gpu_temp_c", "c"),
+               "cpu_load_pct": metric("cpu_load_pct", "pct"), "gpu_load_pct": metric("gpu_load_pct", "pct"),
+               "cpu_clock_mhz": metric("cpu_clock_mhz", "mhz"), "gpu_clock_mhz": metric("gpu_clock_mhz", "mhz"),
+               "gpu_fan_rpm": metric("gpu_fan_rpm", "rpm"), "telemetry": {"baseline_samples": len(baseline), "workload_samples": len(workload), "errors": monitor.errors}}
     (output / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     print(f"\nFile analisis: {output / 'summary.json'} dan {output / 'telemetry.csv'}")
