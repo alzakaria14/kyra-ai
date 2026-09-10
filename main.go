@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -658,12 +659,61 @@ func (a *App) serve() error {
 	a.startMessageWorker()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+	mux.HandleFunc("/benchmark/message", a.benchmarkMessage)
 	mux.HandleFunc("/webhook/message", a.messageWebhook)
 	mux.HandleFunc("/webhook/session", a.sessionWebhook)
 	mux.HandleFunc("/webhook/xendit", a.xenditWebhook)
 	s := &http.Server{Addr: ":" + a.cfg.Port, Handler: logging(mux), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("Kyra berjalan di http://localhost:%s (antrian pesan: %d)", a.cfg.Port, a.cfg.MessageQueueSize)
 	return s.ListenAndServe()
+}
+
+// benchmarkMessage menjalankan bagian Kyra yang membangun prompt dan memanggil
+// Ollama, tanpa WhatsApp gateway dan tanpa mengubah customer/conversations.
+// Endpoint ini sengaja hanya menerima koneksi localhost karena ditujukan untuk
+// pengukuran pada mesin server, bukan API publik.
+func (a *App) benchmarkMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || !net.ParseIP(host).IsLoopback() {
+		http.Error(w, "localhost only", http.StatusForbidden)
+		return
+	}
+	var in struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	in.Message = strings.TrimSpace(in.Message)
+	if in.Message == "" {
+		http.Error(w, "message is required", http.StatusBadRequest)
+		return
+	}
+	products, err := a.products()
+	if err != nil {
+		http.Error(w, "product lookup failed", http.StatusInternalServerError)
+		return
+	}
+	if !isKyraRelevant(in.Message, products, false) {
+		http.Error(w, "message is outside Kyra scope", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	// ID 0 menghasilkan riwayat kosong. Ini menjaga setiap iterasi identik dan
+	// tidak mengotori data customer produksi ketika benchmark berjalan.
+	ai, err := a.askLLM(ctx, Customer{Memory: "Benchmark tanpa riwayat pelanggan."}, products, in.Message)
+	if err != nil {
+		http.Error(w, "ollama request failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]string{"reply": strings.TrimSpace(ai.Reply)})
 }
 
 // startMessageWorker sengaja hanya membuat satu worker. Dengan demikian satu
@@ -1524,10 +1574,9 @@ func (a *App) postJSON(ctx context.Context, target string, payload, out any, ext
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if extra != nil {
-		for k, v := range extra {
-			req.Header[k] = v
-		}
+	// range pada http.Header nil aman; header tambahan bersifat opsional.
+	for k, v := range extra {
+		req.Header[k] = v
 	}
 	res, err := a.client.Do(req)
 	if err != nil {
