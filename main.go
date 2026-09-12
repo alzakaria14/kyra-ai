@@ -660,6 +660,7 @@ func (a *App) serve() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("/benchmark/message", a.benchmarkMessage)
+	mux.HandleFunc("/benchmark/remembering", a.benchmarkRememberingMessage)
 	mux.HandleFunc("/webhook/message", a.messageWebhook)
 	mux.HandleFunc("/webhook/session", a.sessionWebhook)
 	mux.HandleFunc("/webhook/xendit", a.xenditWebhook)
@@ -714,6 +715,123 @@ func (a *App) benchmarkMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]string{"reply": strings.TrimSpace(ai.Reply)})
+}
+
+const benchmarkRememberingPhone = "__benchmark_remembering__"
+
+// benchmarkRememberingMessage mengukur alur Ollama yang memakai remembering
+// pelanggan dan status pesanan nyata dari MySQL. Fixture benchmark dibuat saat
+// setup=true, sedangkan request beban berikutnya hanya membaca database.
+func (a *App) benchmarkRememberingMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || !net.ParseIP(host).IsLoopback() {
+		http.Error(w, "localhost only", http.StatusForbidden)
+		return
+	}
+	var in struct {
+		Message string `json:"message"`
+		Setup   bool   `json:"setup"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	in.Message = strings.TrimSpace(in.Message)
+	if in.Message == "" {
+		http.Error(w, "message is required", http.StatusBadRequest)
+		return
+	}
+	if in.Setup {
+		if err := a.setupRememberingBenchmark(); err != nil {
+			http.Error(w, "benchmark fixture setup failed", http.StatusInternalServerError)
+			return
+		}
+	}
+	var customer Customer
+	err = a.db.QueryRow(`SELECT id,phone,COALESCE(name,''),COALESCE(shipping_address,''),
+		COALESCE(destination_city,''),COALESCE(destination_province,''),memory
+		FROM customers WHERE phone=?`, benchmarkRememberingPhone).Scan(
+		&customer.ID, &customer.Phone, &customer.Name, &customer.ShippingAddress,
+		&customer.DestinationCity, &customer.Province, &customer.Memory)
+	if err == sql.ErrNoRows {
+		http.Error(w, "benchmark fixture is missing; send setup=true first", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		http.Error(w, "customer remembering lookup failed", http.StatusInternalServerError)
+		return
+	}
+	orderContext, orderID, orderStatus, err := a.latestOrderContext(customer.ID)
+	if err != nil {
+		http.Error(w, "order status lookup failed", http.StatusInternalServerError)
+		return
+	}
+	customer.Memory = strings.TrimSpace(customer.Memory + "\n" + orderContext)
+	products, err := a.products()
+	if err != nil {
+		http.Error(w, "product lookup failed", http.StatusInternalServerError)
+		return
+	}
+	if !isKyraRelevant(in.Message, products, false) {
+		http.Error(w, "message is outside Kyra scope", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	ai, err := a.askLLM(ctx, customer, products, in.Message)
+	if err != nil {
+		http.Error(w, "ollama request failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]any{
+		"reply": strings.TrimSpace(ai.Reply), "memory_source": "mysql",
+		"customer_id": customer.ID, "order_id": orderID, "order_status": orderStatus,
+	})
+}
+
+func (a *App) setupRememberingBenchmark() error {
+	const memory = "Pelanggan benchmark bernama Budi. Ia memesan satu Kaos Dayak. Pembayaran sudah diterima dan pesanannya sedang diproses."
+	if _, err := a.db.Exec(`INSERT INTO customers (phone,name,memory)
+		VALUES (?, 'Budi Benchmark', ?)
+		ON DUPLICATE KEY UPDATE name=VALUES(name), memory=VALUES(memory)`, benchmarkRememberingPhone, memory); err != nil {
+		return err
+	}
+	var customerID int64
+	if err := a.db.QueryRow("SELECT id FROM customers WHERE phone=?", benchmarkRememberingPhone).Scan(&customerID); err != nil {
+		return err
+	}
+	var orderID int64
+	err := a.db.QueryRow("SELECT id FROM orders WHERE customer_id=? ORDER BY id DESC LIMIT 1", customerID).Scan(&orderID)
+	if err == sql.ErrNoRows {
+		_, err = a.db.Exec(`INSERT INTO orders
+			(customer_id,status,recipient_name,recipient_phone,shipping_address,shipping_cost,subtotal,total)
+			VALUES (?,'paid','Budi Benchmark',?,'Alamat khusus benchmark',15000,110000,125000)`, customerID, benchmarkRememberingPhone)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	_, err = a.db.Exec(`UPDATE orders SET status='paid',recipient_name='Budi Benchmark',
+		recipient_phone=?,shipping_address='Alamat khusus benchmark',shipping_cost=15000,
+		subtotal=110000,total=125000 WHERE id=?`, benchmarkRememberingPhone, orderID)
+	return err
+}
+
+func (a *App) latestOrderContext(customerID int64) (string, int64, string, error) {
+	var orderID, total int64
+	var status string
+	err := a.db.QueryRow(`SELECT id,status,total FROM orders
+		WHERE customer_id=? ORDER BY id DESC LIMIT 1`, customerID).Scan(&orderID, &status, &total)
+	if err != nil {
+		return "", 0, "", err
+	}
+	context := fmt.Sprintf("DATA PESANAN MYSQL TERBARU:\nNomor pesanan: #%d\nStatus: %s\nTotal: Rp%d", orderID, status, total)
+	return context, orderID, status, nil
 }
 
 // startMessageWorker sengaja hanya membuat satu worker. Dengan demikian satu
