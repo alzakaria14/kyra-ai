@@ -2,3 +2,5 @@
 kyra.exe
 bin/
 benchmark_results/
+benchmark_results_remembering/
+*.md
