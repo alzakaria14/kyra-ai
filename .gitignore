@@ -4,3 +4,5 @@ bin/
 benchmark_results/
 benchmark_results_remembering/
 *.md
+article/
+!README.md
